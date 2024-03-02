@@ -1,0 +1,67 @@
+#!/bin/bash
+
+# CHANGE THIS TO ACTUAL PUBLIC INTERFACE !!!!!!
+EXT_IF=venet0:0
+
+ip a show ${EXT_IF} || exit 1
+[ $(id -u) -eq 0 ] || { echo "must be root"; kill 0; }
+
+ufw disable
+systemctl disable ufw
+systemctl stop ufw
+apt-get -y remove ufw
+
+# Ensure rules are saved and restored on restart:
+DEBIAN_FRONTEND=noninteractive
+apt-get -y install iptables-persistent netfilter-persistent
+systemctl enable netfilter-persistent
+
+# Ensure we don't get dropped while loading new rules:
+iptables -P INPUT ACCEPT
+iptables -F INPUT
+
+# Always allow VPN or loopback, and keep state:
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -i wg0 -j ACCEPT
+iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# Allow local communication with docker nets:
+iptables -A INPUT -s 172.16.0.0/12 -j ACCEPT # very important!
+
+# Services:
+iptables -A INPUT -p tcp -m tcp --dport 9999999 -j ACCEPT
+
+# To filter docker ports we have to use the DOCKER-USER chain, RETURN allows the connection.
+# We use the contrack modules original destination port attribute instead of tcp/udp module's dport.
+iptables -F DOCKER-USER
+iptables -A DOCKER-USER -i ${EXT_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+iptables -A DOCKER-USER -i ${EXT_IF} -p tcp -m tcp -m conntrack --ctorigdstport 9999999 -j RETURN
+
+# Block the rest:
+iptables -A DOCKER-USER -i ${EXT_IF} -j DROP # Drop all from external interface
+iptables -A DOCKER-USER -j RETURN            # allow all other interfaces
+iptables -P INPUT DROP
+
+# ALLOW WHAT YOU WANT HERE:
+iptables -I DOCKER-USER -p tcp ! -s DESIRED_IP_HERE --dport 9999999 -j DROP
+
+# Clean up any old ufw tables:
+iptables-save| grep -v ufw |iptables-restore
+
+# Now IPv6 - docker containers accessed via IPv6 don't use the USER chain so INPUT chain handles it fine, not sure why :/
+# ip6tables -P INPUT ACCEPT
+# ip6tables -F INPUT
+# ip6tables -A INPUT -i lo -j ACCEPT
+# 
+# # IPv6 needs ICMP or it will not work:
+# ip6tables -A INPUT -p icmpv6 -j ACCEPT
+# ip6tables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+# 
+# # Public services:
+# ip6tables -A INPUT -p tcp --dport 9999999 -j ACCEPT
+# 
+# ip6tables -P INPUT DROP
+# ip6tables-save| grep -v ufw |ip6tables-restore
+
+# Save:
+netfilter-persistent save
